@@ -1,22 +1,58 @@
 // Package parser implements the w_popularity LinkedIn adapter.
 //
-// LinkedIn aggressively blocks unauthenticated scraping. Most non-logged-in
-// HTTP requests return either:
+// LinkedIn aggressively blocks unauthenticated scraping. A logged-out
+// HTTP GET of https://www.linkedin.com/in/<handle>/ almost always
+// returns HTTP 999 (LinkedIn's own "no scraping" status) and a body
+// that JS-redirects to /authwall. The schema.org Person LD-JSON block
+// is also empty on the logged-out path: there is no follower count to
+// scrape.
 //
-//   - HTTP 999 (LinkedIn's own "no scraping" status) with a tiny HTML body
-//     that JS-redirects to /authwall.
-//   - A real public profile page if the IP / UA / cookies look organic
-//     enough. Such pages carry one or more
-//     <script type="application/ld+json"> blocks describing the profile as
-//     schema.org Person / ProfilePage.
+// Strategy (in priority order):
 //
-// Strategy:
+//  1. **Authenticated HTML scrape via `li_at` session cookie.** When
+//     Config.LIATCookie is set we attach `Cookie: li_at=...` (and an
+//     optional JSESSIONID) to the request. LinkedIn then serves the
+//     real profile page HTML, which embeds structured data in three
+//     possible shapes:
 //
-//	primary:  plain HTTP GET of https://www.linkedin.com/in/<handle>/ +
-//	          LD-JSON extraction.
-//	fallback: camoufox-driven browser (CDP) — currently a stub. The
-//	          primary→fallback branch is wired so the real implementation
-//	          is a drop-in replacement for fetchViaCamoufox.
+//     a. BPR datalets:
+//
+//     <code id="datalet-bpr-guid-…" style="display:none">
+//     <!--{"data":{"data": {...}, "included": [{...}]}}-->
+//     </code>
+//
+//     Each datalet body is an HTML comment around a JSON object.
+//     For profile pages, the `included` array contains nodes with
+//     follower / connection counters and headline/location fields.
+//     This is LinkedIn's own browser-proxy payload format and is the
+//     most reliable extraction surface today.
+//
+//     b. window.__APOLLO_STATE__: occasionally a different render path
+//     emits an Apollo cache as a JS global. Less common, but worth
+//     trying as a secondary.
+//
+//     c. <script type="application/ld+json"> with @type=Person: when
+//     authenticated the LD-JSON `interactionStatistic` array carries
+//     a real `followers` counter (zero for logged-out fetches, which
+//     is why the previous implementation always returned 0).
+//
+//     The extractor is intentionally tolerant: it deep-walks every
+//     decoded JSON tree looking for known keys (followerCount,
+//     connectionsCount, headline, location, industryName, …) and
+//     stops at the first hit. We never want a LinkedIn UI rotation to
+//     break the whole pipeline; missing fields downgrade to 0 plus a
+//     diagnostic marker in Raw["fetch_note"].
+//
+//  2. **camoufox via Playwright (skeleton).** Config.CamoufoxURL is the
+//     CDP endpoint of a running camoufox instance (same shape as the
+//     facebook/instagram adapters). fetchViaCamoufox is currently a
+//     stub — the branching is in place so a real implementation is a
+//     drop-in replacement.
+//
+// When both LIATCookie and CamoufoxURL are empty we return ErrAuth with
+// the hint "set LI_AT cookie or CAMOUFOX_URL". When LIATCookie is set
+// but LinkedIn still answers 999 we treat the cookie as expired and
+// return ErrAuth with "li_at cookie expired".
 package parser
 
 import (
@@ -35,115 +71,135 @@ import (
 	shared "github.com/suenot/w-popularity-shared"
 )
 
-// apiBase is the canonical LinkedIn origin. Tests rewrite this via a
-// custom RoundTripper (see parser_test.go); production hits the real host.
-const apiBase = "https://www.linkedin.com"
+// defaultBaseURL is the canonical LinkedIn origin. Tests rewrite this via
+// Config.BaseURL or a custom RoundTripper.
+const defaultBaseURL = "https://www.linkedin.com"
 
 const defaultUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
-	"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
 // Config controls runtime behaviour.
 type Config struct {
-	// HTTPClient is optional; one with HTTPTimeout is constructed otherwise.
+	// LIATCookie is the `li_at` session cookie of a logged-in LinkedIn
+	// browser session. This is the primary auth surface. Pulled from
+	// the LINKEDIN_LI_AT env var by callers. Empty disables the
+	// authenticated path.
+	LIATCookie string
+
+	// JSESSIONID is an optional companion cookie. Some LinkedIn server
+	// endpoints check it; the profile page generally doesn't, but we
+	// forward it when present.
+	JSESSIONID string
+
+	// HTTPClient is optional; one with HTTPTimeout is constructed
+	// otherwise. The default client does not auto-follow LinkedIn's
+	// 301-to-authwall chain — we want to inspect the first response.
 	HTTPClient *http.Client
+
 	// HTTPTimeout caps every outbound call. Defaults to 15s.
 	HTTPTimeout time.Duration
-	// UserAgent overrides the default browser-ish UA.
+
+	// UserAgent overrides the default desktop Chrome UA. LinkedIn is
+	// pickier about UAs than most sites; a realistic value is required.
 	UserAgent string
+
 	// CamoufoxURL is the CDP endpoint of a camoufox instance. When set,
-	// the parser falls back to it after the public HTML attempt fails or
-	// is gated by an auth wall. Empty disables the fallback.
+	// and LIATCookie is not, the parser falls back to it. Empty
+	// disables the fallback.
 	CamoufoxURL string
+
+	// BaseURL overrides https://www.linkedin.com. Test hook.
+	BaseURL string
 }
 
 // New constructs a LinkedIn parser.
 func New(cfg Config) *LinkedInParser {
+	if cfg.HTTPTimeout == 0 {
+		cfg.HTTPTimeout = 15 * time.Second
+	}
 	if cfg.HTTPClient == nil {
-		t := cfg.HTTPTimeout
-		if t == 0 {
-			t = 15 * time.Second
-		}
-		// Don't auto-follow LinkedIn's 301-to-authwall redirect chain —
-		// we want to inspect the first response.
-		cfg.HTTPClient = &http.Client{Timeout: t}
+		cfg.HTTPClient = &http.Client{Timeout: cfg.HTTPTimeout}
 	}
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = defaultUA
 	}
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = defaultBaseURL
+	}
+	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
 	return &LinkedInParser{cfg: cfg}
 }
 
+// LinkedInParser is the public entry point.
 type LinkedInParser struct{ cfg Config }
 
+// Platform implements shared.Parser.
 func (p *LinkedInParser) Platform() shared.Platform { return shared.PlatformLinkedIn }
 
 // --- Channel ---
 
+// FetchChannel returns the latest snapshot for handle. The handle may
+// be a bare vanity name (`suenot`) or a full profile URL.
 func (p *LinkedInParser) FetchChannel(ctx context.Context, handle string) (shared.ChannelSnapshot, error) {
 	h := normalizeHandle(handle)
 	if h == "" {
 		return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: empty handle")
 	}
-	profileURL := apiBase + "/in/" + url.PathEscape(h) + "/"
+	profileURL := p.cfg.BaseURL + "/in/" + url.PathEscape(h) + "/"
+	// The canonical (production) URL is always what we surface to callers,
+	// regardless of any BaseURL test override.
+	canonicalURL := defaultBaseURL + "/in/" + url.PathEscape(h) + "/"
+
+	// Branching: no cookie -> try camoufox -> fail with the right hint.
+	if p.cfg.LIATCookie == "" {
+		return p.viaCamoufoxOrAuthErr(ctx, profileURL, canonicalURL, h, 0)
+	}
 
 	body, status, err := p.getRaw(ctx, profileURL)
-	if err == nil {
-		switch {
-		case status == 404:
-			return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: %w", shared.ErrNotFound)
-		case status == 429:
-			return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: %w", shared.ErrRateLimited)
-		case status == 999, status == 403:
-			// Auth wall — try camoufox fallback if configured.
-			return p.viaCamoufoxOrAuthErr(ctx, profileURL, h, status)
-		case status >= 500:
-			return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: %w: http %d", shared.ErrTransient, status)
-		case status >= 400:
-			return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: http %d", status)
-		}
-
-		if isAuthWallHTML(body) {
-			return p.viaCamoufoxOrAuthErr(ctx, profileURL, h, status)
-		}
-
-		snap := parseProfileHTML(body, h, profileURL)
-		return snap, nil
+	if err != nil {
+		return shared.ChannelSnapshot{}, err
 	}
 
-	// Transport-level error — try the camoufox path if available.
-	if camErr := p.tryCamoufox(ctx, profileURL); camErr == nil {
-		// Camoufox path is currently a stub; if it ever returns nil err
-		// we'd parse its HTML here. Kept as a forward-compatible branch.
-		return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: camoufox path returned no body")
+	switch {
+	case status == http.StatusNotFound:
+		return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: %w", shared.ErrNotFound)
+	case status == http.StatusTooManyRequests:
+		return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: %w", shared.ErrRateLimited)
+	case status == 999, status == http.StatusForbidden:
+		// Cookie was set but LinkedIn still slammed the door. Almost
+		// always means the li_at cookie has expired (they live ~1y).
+		return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: %w: li_at cookie expired (refresh from a logged-in browser)", shared.ErrAuth)
+	case status >= 500:
+		return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: %w: http %d", shared.ErrTransient, status)
+	case status >= 400:
+		return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: http %d", status)
 	}
-	return shared.ChannelSnapshot{}, err
+
+	// 2xx: even with a valid cookie LinkedIn occasionally bounces us to
+	// /authwall (region restrictions, rate limiting, etc).
+	if isAuthWallHTML(body) {
+		return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: %w: authwall returned despite li_at cookie (likely expired)", shared.ErrAuth)
+	}
+
+	snap := parseProfileHTML(body, h, canonicalURL)
+	return snap, nil
 }
 
-func (p *LinkedInParser) viaCamoufoxOrAuthErr(ctx context.Context, profileURL, handle string, status int) (shared.ChannelSnapshot, error) {
+// viaCamoufoxOrAuthErr is the no-cookie branch. It tries the camoufox
+// path (currently a stub) and, on failure, returns ErrAuth with a
+// status-appropriate hint.
+func (p *LinkedInParser) viaCamoufoxOrAuthErr(ctx context.Context, profileURL, canonicalURL, handle string, status int) (shared.ChannelSnapshot, error) {
 	html, err := p.fetchViaCamoufox(ctx, profileURL)
 	if err == nil && html != "" {
-		return parseProfileHTML(html, handle, profileURL), nil
+		return parseProfileHTML(html, handle, canonicalURL), nil
 	}
-	hint := "auth wall"
-	if status == 999 {
-		hint = "http 999 auth wall"
-	} else if status == 403 {
-		hint = "http 403 auth wall"
-	}
-	return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: %w: %s; configure Config.CamoufoxURL for browser fallback", shared.ErrAuth, hint)
+	return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: %w: set LI_AT cookie or CAMOUFOX_URL", shared.ErrAuth)
 }
 
-func (p *LinkedInParser) tryCamoufox(ctx context.Context, profileURL string) error {
-	if _, err := p.fetchViaCamoufox(ctx, profileURL); err != nil {
-		return err
-	}
-	return nil
-}
-
-// fetchViaCamoufox is a stub for the camoufox / CDP fallback. The wiring
-// for primary→fallback is in place; a real implementation would dial
-// Config.CamoufoxURL with chromedp (or similar), navigate to profileURL,
-// wait for the profile DOM, and return the rendered HTML.
+// fetchViaCamoufox is a stub for the camoufox / CDP fallback. The
+// wiring for cookie-missing→fallback is in place; a real implementation
+// would dial Config.CamoufoxURL with chromedp (or similar), navigate to
+// profileURL, wait for the profile DOM, and return the rendered HTML.
 func (p *LinkedInParser) fetchViaCamoufox(_ context.Context, _ string) (string, error) {
 	if p.cfg.CamoufoxURL == "" {
 		return "", errors.New("linkedin: camoufox not configured")
@@ -153,28 +209,32 @@ func (p *LinkedInParser) fetchViaCamoufox(_ context.Context, _ string) (string, 
 
 // --- Posts ---
 
-// FetchRecentPosts is best-effort. Logged-out LinkedIn profiles rarely
-// expose post lists; we extract whatever Article items the LD-JSON
-// happens to carry (under publishingPrinciples / subjectOf / mainEntity).
-// When nothing is parseable we return (nil, nil) rather than an error.
+// FetchRecentPosts is best-effort. Profile pages don't expose a post
+// stream without hitting /detail/recent-activity/shares/ as the logged-in
+// user — which costs a second request and a second cookie surface. For
+// now we extract whatever Article items happen to appear in LD-JSON
+// (rare, but free) and return (nil, nil) for everything else.
 func (p *LinkedInParser) FetchRecentPosts(ctx context.Context, handle string, since time.Time) ([]shared.PostSnapshot, error) {
 	h := normalizeHandle(handle)
 	if h == "" {
 		return nil, fmt.Errorf("linkedin: empty handle")
 	}
-	profileURL := apiBase + "/in/" + url.PathEscape(h) + "/"
+	if p.cfg.LIATCookie == "" {
+		// Same branching as FetchChannel: without a cookie we can't see
+		// the post stream. Soft-empty so callers keep going.
+		return nil, nil
+	}
+	profileURL := p.cfg.BaseURL + "/in/" + url.PathEscape(h) + "/"
 	body, status, err := p.getRaw(ctx, profileURL)
 	if err != nil {
 		return nil, err
 	}
 	switch {
-	case status == 404:
+	case status == http.StatusNotFound:
 		return nil, fmt.Errorf("linkedin: %w", shared.ErrNotFound)
-	case status == 429:
+	case status == http.StatusTooManyRequests:
 		return nil, fmt.Errorf("linkedin: %w", shared.ErrRateLimited)
-	case status == 999, status == 403:
-		// No posts visible without auth; treat as soft-empty so callers
-		// can still proceed.
+	case status == 999, status == http.StatusForbidden:
 		return nil, nil
 	case status >= 400:
 		return nil, fmt.Errorf("linkedin: http %d", status)
@@ -185,142 +245,227 @@ func (p *LinkedInParser) FetchRecentPosts(ctx context.Context, handle string, si
 	return parseArticlesFromHTML(body, h, since), nil
 }
 
-// --- LD-JSON parsing ---
+// --- Profile HTML parsing ---
 
-var reLDJSON = regexp.MustCompile(`(?is)<script[^>]+type=["']application/ld\+json["'][^>]*>(.*?)</script>`)
+var (
+	// reLDJSON matches <script type="application/ld+json">…</script>.
+	reLDJSON = regexp.MustCompile(`(?is)<script[^>]+type=["']application/ld\+json["'][^>]*>(.*?)</script>`)
+	// reDatalet matches a single BPR datalet <code id="datalet-bpr-…">…</code>
+	// block. The body of each datalet is wrapped in an HTML comment.
+	reDatalet = regexp.MustCompile(`(?is)<code[^>]*id=["']datalet-bpr-guid-[^"']+["'][^>]*>(.*?)</code>`)
+	// reDataletComment strips the surrounding `<!--` / `-->` wrapper.
+	reDataletComment = regexp.MustCompile(`(?s)^\s*<!--(.*?)-->\s*$`)
+	// reApolloState matches the inline `window.__APOLLO_STATE__ = {...};`
+	// assignment. Trailing semicolon optional.
+	reApolloState = regexp.MustCompile(`(?is)window\.__APOLLO_STATE__\s*=\s*(\{.*?\})\s*;\s*</script>`)
+)
 
-// parseProfileHTML extracts a best-effort ChannelSnapshot from a public
-// profile page. If no LD-JSON / no followers field is found, we still
-// return a snapshot (with whatever signals we did find in Raw) — we
-// don't want to fail every fetch just because LinkedIn rotated its DOM.
+// followerKeys are the JSON keys we treat as a follower count. Order
+// doesn't matter — extraction returns the first numeric hit.
+var followerKeys = map[string]struct{}{
+	"followerCount":       {},
+	"followersCount":      {},
+	"numFollowers":        {},
+	"numberOfFollowers":   {},
+	"followers":           {},
+	"userInteractionCount": {}, // schema.org InteractionCounter
+}
+
+// connectionKeys mirror followerKeys for connections.
+var connectionKeys = map[string]struct{}{
+	"connectionCount":     {},
+	"connectionsCount":    {},
+	"numConnections":      {},
+	"numberOfConnections": {},
+}
+
+// stringKeysOfInterest are the textual fields we copy into Raw when we
+// stumble across them during the deep walk.
+var stringKeysOfInterest = map[string]string{
+	"headline":       "headline",
+	"firstName":      "first_name",
+	"lastName":       "last_name",
+	"locationName":   "location",
+	"geoLocationName": "location",
+	"industryName":   "industry",
+	"occupation":     "occupation",
+}
+
+// parseProfileHTML extracts a best-effort ChannelSnapshot from a
+// (authenticated) profile page. We try the BPR datalets first, then
+// __APOLLO_STATE__, then LD-JSON, accumulating Raw fields as we go and
+// short-circuiting the moment we find a follower count.
 func parseProfileHTML(body, handle, profileURL string) shared.ChannelSnapshot {
 	snap := shared.ChannelSnapshot{
 		Platform:  shared.PlatformLinkedIn,
 		Handle:    handle,
 		URL:       profileURL,
 		FetchedAt: time.Now().UTC(),
-		Raw:       map[string]interface{}{"source": "public_html"},
+		Raw:       map[string]interface{}{"source": "authenticated_html"},
 	}
 
-	matches := reLDJSON.FindAllStringSubmatch(body, -1)
-	for _, m := range matches {
+	// Try BPR datalets (most reliable surface today).
+	if applyDatalets(&snap, body) {
+		return snap
+	}
+	// Apollo state.
+	if applyApolloState(&snap, body) {
+		return snap
+	}
+	// LD-JSON.
+	if applyLDJSON(&snap, body) {
+		return snap
+	}
+
+	// Nothing matched. Surface a diagnostic so operators can tell this
+	// apart from "auth wall" or "real zero-follower account".
+	snap.Raw["fetch_note"] = "no structured data extracted (datalets/apollo/ldjson all empty); LinkedIn DOM may have rotated"
+	return snap
+}
+
+// applyDatalets walks every BPR datalet body, decodes its JSON, and
+// deep-walks the tree. Returns true once a follower count is found.
+func applyDatalets(snap *shared.ChannelSnapshot, body string) bool {
+	got := false
+	for _, m := range reDatalet.FindAllStringSubmatch(body, -1) {
+		if len(m) < 2 {
+			continue
+		}
+		inner := m[1]
+		// Datalet bodies are wrapped in <!-- … -->. Strip the wrapper.
+		if cm := reDataletComment.FindStringSubmatch(inner); len(cm) == 2 {
+			inner = cm[1]
+		}
+		inner = strings.TrimSpace(inner)
+		if inner == "" {
+			continue
+		}
+		var obj interface{}
+		if err := json.Unmarshal([]byte(inner), &obj); err != nil {
+			continue
+		}
+		if walkForProfile(snap, obj) {
+			got = true
+			snap.Raw["source"] = "bpr_datalet"
+			// Don't return early: keep walking so Raw keeps
+			// accumulating from later datalets.
+		}
+	}
+	return got
+}
+
+// applyApolloState extracts window.__APOLLO_STATE__ and walks it.
+func applyApolloState(snap *shared.ChannelSnapshot, body string) bool {
+	m := reApolloState.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return false
+	}
+	var obj interface{}
+	if err := json.Unmarshal([]byte(m[1]), &obj); err != nil {
+		return false
+	}
+	if walkForProfile(snap, obj) {
+		snap.Raw["source"] = "apollo_state"
+		return true
+	}
+	return false
+}
+
+// applyLDJSON walks each ld+json block.
+func applyLDJSON(snap *shared.ChannelSnapshot, body string) bool {
+	got := false
+	for _, m := range reLDJSON.FindAllStringSubmatch(body, -1) {
 		if len(m) < 2 {
 			continue
 		}
 		raw := strings.TrimSpace(m[1])
-		// Strip a UTF-8 BOM if present (LinkedIn occasionally emits one).
-		raw = strings.TrimPrefix(raw, "\ufeff")
+		raw = strings.TrimPrefix(raw, "\ufeff") // strip UTF-8 BOM if present
 
-		// First try as a single object.
-		var obj map[string]interface{}
-		if err := json.Unmarshal([]byte(raw), &obj); err == nil {
-			if applyPerson(&snap, obj) {
-				return snap
+		var obj interface{}
+		if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+			continue
+		}
+		if walkForProfile(snap, obj) {
+			snap.Raw["source"] = "ldjson"
+			got = true
+		}
+	}
+	return got
+}
+
+// walkForProfile is the deep JSON walker. It descends maps and slices
+// looking for any followerKeys / connectionKeys / stringKeysOfInterest
+// and populates snap as it goes. Returns true once it has populated
+// at least a follower count.
+func walkForProfile(snap *shared.ChannelSnapshot, node interface{}) bool {
+	switch v := node.(type) {
+	case map[string]interface{}:
+		// Special-case schema.org InteractionCounter: only treat
+		// userInteractionCount as followers when the sibling "name" or
+		// "interactionType" says so. Otherwise it could be e.g. likes.
+		if _, ok := v["userInteractionCount"]; ok {
+			name, _ := v["name"].(string)
+			itype := stringOrEmpty(v["interactionType"])
+			if strings.EqualFold(name, "followers") ||
+				strings.Contains(strings.ToLower(itype), "follow") {
+				if n, ok := numericField(v["userInteractionCount"]); ok && snap.Followers == 0 {
+					snap.Followers = n
+				}
 			}
-			// Handle @graph wrappers.
-			if graph, ok := obj["@graph"].([]interface{}); ok {
-				for _, g := range graph {
-					if gm, ok := g.(map[string]interface{}); ok {
-						if applyPerson(&snap, gm) {
-							return snap
+		}
+
+		for k, val := range v {
+			// Numeric fields of interest.
+			if _, ok := followerKeys[k]; ok && k != "userInteractionCount" {
+				if n, ok := numericField(val); ok && snap.Followers == 0 {
+					snap.Followers = n
+				}
+			}
+			if _, ok := connectionKeys[k]; ok {
+				if n, ok := numericField(val); ok {
+					if _, exists := snap.Raw["connections_count"]; !exists {
+						snap.Raw["connections_count"] = n
+					}
+				}
+			}
+			// Textual fields of interest.
+			if rawKey, ok := stringKeysOfInterest[k]; ok {
+				if s, ok := val.(string); ok && s != "" {
+					if _, exists := snap.Raw[rawKey]; !exists {
+						snap.Raw[rawKey] = s
+					}
+				}
+			}
+			// currentCompany / company is sometimes a string and
+			// sometimes a nested object with a `name` field.
+			if k == "currentCompany" || k == "companyName" {
+				switch cv := val.(type) {
+				case string:
+					if cv != "" {
+						if _, exists := snap.Raw["current_company"]; !exists {
+							snap.Raw["current_company"] = cv
+						}
+					}
+				case map[string]interface{}:
+					if name, ok := cv["name"].(string); ok && name != "" {
+						if _, exists := snap.Raw["current_company"]; !exists {
+							snap.Raw["current_company"] = name
 						}
 					}
 				}
 			}
-			continue
+			// Recurse.
+			walkForProfile(snap, val)
 		}
-		// Otherwise try as an array.
-		var arr []map[string]interface{}
-		if err := json.Unmarshal([]byte(raw), &arr); err == nil {
-			for _, item := range arr {
-				if applyPerson(&snap, item) {
-					return snap
-				}
-			}
+	case []interface{}:
+		for _, item := range v {
+			walkForProfile(snap, item)
 		}
 	}
-	return snap
+	return snap.Followers > 0
 }
 
-// applyPerson populates the snapshot from a single LD-JSON node. Returns
-// true when the node matched Person/ProfilePage so the caller can stop
-// scanning.
-func applyPerson(snap *shared.ChannelSnapshot, node map[string]interface{}) bool {
-	t, _ := stringOrFirst(node["@type"])
-	switch t {
-	case "Person", "ProfilePage":
-		// fall through
-	default:
-		return false
-	}
-	if name, ok := node["name"].(string); ok && name != "" {
-		snap.Raw["display_name"] = name
-	}
-	if job, ok := node["jobTitle"].(string); ok && job != "" {
-		snap.Raw["job_title"] = job
-	}
-	if desc, ok := node["description"].(string); ok && desc != "" {
-		snap.Raw["description"] = desc
-	}
-	// Followers can appear in several places — try them all.
-	if v := extractFollowers(node); v > 0 {
-		snap.Followers = v
-	}
-	// Some payloads expose article counts via subjectOf.
-	if arts, ok := node["subjectOf"].([]interface{}); ok {
-		snap.PostsCount = int64(countArticles(arts))
-	}
-	return true
-}
-
-// extractFollowers walks the common LinkedIn / schema.org shapes for a
-// follower count.
-func extractFollowers(node map[string]interface{}) int64 {
-	// interactionStatistic: [{ "@type":"InteractionCounter", "name":"followers", "userInteractionCount":N }, ...]
-	if stats, ok := node["interactionStatistic"].([]interface{}); ok {
-		for _, s := range stats {
-			sm, ok := s.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			name, _ := sm["name"].(string)
-			itype, _ := stringOrFirst(sm["interactionType"])
-			if !strings.EqualFold(name, "followers") &&
-				!strings.Contains(strings.ToLower(itype), "follow") {
-				continue
-			}
-			if v, ok := numericField(sm["userInteractionCount"]); ok {
-				return v
-			}
-		}
-	}
-	// Sometimes a single object instead of an array.
-	if sm, ok := node["interactionStatistic"].(map[string]interface{}); ok {
-		if v, ok := numericField(sm["userInteractionCount"]); ok {
-			return v
-		}
-	}
-	// LinkedIn's "follows" / "followee" extension fields, if ever present.
-	if v, ok := numericField(node["follows"]); ok {
-		return v
-	}
-	return 0
-}
-
-func countArticles(items []interface{}) int {
-	n := 0
-	for _, it := range items {
-		m, ok := it.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		t, _ := stringOrFirst(m["@type"])
-		if t == "Article" || t == "BlogPosting" || t == "SocialMediaPosting" {
-			n++
-		}
-	}
-	return n
-}
+// --- Article extraction (best-effort posts) ---
 
 func parseArticlesFromHTML(body, handle string, since time.Time) []shared.PostSnapshot {
 	var out []shared.PostSnapshot
@@ -335,7 +480,6 @@ func parseArticlesFromHTML(body, handle string, since time.Time) []shared.PostSn
 		if err := json.Unmarshal([]byte(raw), &obj); err != nil {
 			continue
 		}
-		// Look for Article items under subjectOf or publishingPrinciples.
 		for _, key := range []string{"subjectOf", "publishingPrinciples", "mainEntity"} {
 			arr, ok := obj[key].([]interface{})
 			if !ok {
@@ -416,12 +560,31 @@ func (p *LinkedInParser) getRaw(ctx context.Context, u string) (string, int, err
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
+	// Attach the li_at session cookie. We build the Cookie header
+	// directly rather than using http.Client.Jar to keep the parser
+	// stateless across calls.
+	var cookies []string
+	if p.cfg.LIATCookie != "" {
+		cookies = append(cookies, "li_at="+p.cfg.LIATCookie)
+	}
+	if p.cfg.JSESSIONID != "" {
+		// LinkedIn wraps JSESSIONID in quotes in real browsers. Match that.
+		js := p.cfg.JSESSIONID
+		if !strings.HasPrefix(js, "\"") {
+			js = "\"" + strings.Trim(js, "\"") + "\""
+		}
+		cookies = append(cookies, "JSESSIONID="+js)
+	}
+	if len(cookies) > 0 {
+		req.Header.Set("Cookie", strings.Join(cookies, "; "))
+	}
+
 	resp, err := p.cfg.HTTPClient.Do(req)
 	if err != nil {
 		return "", 0, fmt.Errorf("linkedin: %w: %v", shared.ErrTransient, err)
 	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20)) // 16 MiB cap
 	if err != nil {
 		return "", resp.StatusCode, fmt.Errorf("linkedin: %w: read body: %v", shared.ErrTransient, err)
 	}
@@ -430,12 +593,7 @@ func (p *LinkedInParser) getRaw(ctx context.Context, u string) (string, int, err
 
 // --- helpers ---
 
-// isAuthWallHTML detects LinkedIn's various auth-wall responses. The
-// canonical signals are:
-//   - the literal string "authwall" or "authwall_join_form"
-//   - absence of any application/ld+json block on a body that does have
-//     a <html> tag (i.e. it's not just a parser error)
-//   - the auth-wall <meta> redirect noscript line
+// isAuthWallHTML detects LinkedIn's various auth-wall responses.
 func isAuthWallHTML(body string) bool {
 	low := strings.ToLower(body)
 	if strings.Contains(low, "authwall_join_form") {
@@ -453,7 +611,6 @@ func isAuthWallHTML(body string) bool {
 func normalizeHandle(h string) string {
 	h = strings.TrimSpace(h)
 	h = strings.TrimPrefix(h, "@")
-	// Accept full URLs like https://www.linkedin.com/in/suenot/
 	if i := strings.Index(h, "linkedin.com/in/"); i >= 0 {
 		h = h[i+len("linkedin.com/in/"):]
 	}
@@ -480,6 +637,11 @@ func stringOrFirst(v interface{}) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func stringOrEmpty(v interface{}) string {
+	s, _ := stringOrFirst(v)
+	return s
 }
 
 func numericField(v interface{}) (int64, bool) {
