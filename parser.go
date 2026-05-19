@@ -391,10 +391,70 @@ func parseProfileHTML(body, handle, profileURL string) shared.ChannelSnapshot {
 		return snap
 	}
 
+	// Fallback: regex-scrape the React Server Components serialized output
+	// for `N connections` / `N followers`. LinkedIn's current personal-
+	// profile render embeds the counts as plain text inside the RSC payload
+	// (e.g. `<p>218 connections</p>` and `\"218 connections\"`).
+	if applyTextCounters(&snap, body) {
+		return snap
+	}
+
 	// Nothing matched. Surface a diagnostic so operators can tell this
 	// apart from "auth wall" or "real zero-follower account".
-	snap.Raw["fetch_note"] = "no structured data extracted (datalets/apollo/ldjson all empty); LinkedIn DOM may have rotated"
+	snap.Raw["fetch_note"] = "no structured data extracted (datalets/apollo/ldjson/text-counters all empty); LinkedIn DOM may have rotated"
 	return snap
+}
+
+// applyTextCounters scrapes the rendered HTML for the visible counters that
+// LinkedIn prints on the profile top-card: "<N> connections" and/or
+// "<N> followers" (premium accounts only). Connection count is the closest
+// "audience" proxy for non-premium personal profiles, which is the common
+// case for w_popularity users.
+//
+// Numbers may be plain ("218"), comma-grouped ("1,234"), or use the LinkedIn
+// "500+" suffix — we strip the plus.
+var reTextCounters = regexp.MustCompile(`([\d,]+)\+?\s+(connection|follower)s?\b`)
+
+func applyTextCounters(snap *shared.ChannelSnapshot, body string) bool {
+	matches := reTextCounters.FindAllStringSubmatch(body, -1)
+	if len(matches) == 0 {
+		return false
+	}
+	var connections, followers int64
+	for _, m := range matches {
+		nRaw := strings.ReplaceAll(m[1], ",", "")
+		n, err := strconv.ParseInt(nRaw, 10, 64)
+		if err != nil {
+			continue
+		}
+		switch strings.ToLower(m[2]) {
+		case "connection":
+			if n > connections {
+				connections = n
+			}
+		case "follower":
+			if n > followers {
+				followers = n
+			}
+		}
+	}
+	if connections == 0 && followers == 0 {
+		return false
+	}
+	// Followers preferred when present (premium), else connections.
+	if followers > 0 {
+		snap.Followers = followers
+	} else {
+		snap.Followers = connections
+	}
+	if connections > 0 {
+		snap.Raw["connection_count"] = connections
+	}
+	if followers > 0 {
+		snap.Raw["follower_count"] = followers
+	}
+	snap.Raw["extracted_via"] = "text_counters"
+	return true
 }
 
 // applyDatalets walks every BPR datalet body, decodes its JSON, and
