@@ -56,6 +56,7 @@
 package parser
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -196,15 +197,88 @@ func (p *LinkedInParser) viaCamoufoxOrAuthErr(ctx context.Context, profileURL, c
 	return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: %w: set LI_AT cookie or CAMOUFOX_URL", shared.ErrAuth)
 }
 
-// fetchViaCamoufox is a stub for the camoufox / CDP fallback. The
-// wiring for cookie-missing→fallback is in place; a real implementation
-// would dial Config.CamoufoxURL with chromedp (or similar), navigate to
-// profileURL, wait for the profile DOM, and return the rendered HTML.
-func (p *LinkedInParser) fetchViaCamoufox(_ context.Context, _ string) (string, error) {
+// camoufoxFetchRequest mirrors the JSON body accepted by POST /fetch on the
+// camoufox HTTP wrapper (see camoufox/server.py).
+type camoufoxFetchRequest struct {
+	URL             string `json:"url"`
+	Profile         string `json:"profile"`
+	WaitForSelector string `json:"wait_for_selector,omitempty"`
+	TimeoutMS       int    `json:"timeout_ms,omitempty"`
+}
+
+// camoufoxFetchResponse mirrors the response envelope.
+type camoufoxFetchResponse struct {
+	HTML           string `json:"html"`
+	Status         int    `json:"status"`
+	FinalURL       string `json:"final_url"`
+	Title          string `json:"title"`
+	CookiesPresent bool   `json:"cookies_present"`
+	// Populated when the wrapper returns a non-2xx with {"error": "..."}.
+	Error string `json:"error,omitempty"`
+}
+
+// fetchViaCamoufox POSTs the target URL to the camoufox wrapper, gets back
+// the fully-rendered HTML, and returns it. The caller passes the HTML
+// through the same extractors that the cookie-auth path uses.
+//
+// Network/transport failures are mapped to ErrTransient so the scheduler
+// retries them. HTTP 4xx from the wrapper means "we asked for something
+// invalid" — we propagate as-is.
+func (p *LinkedInParser) fetchViaCamoufox(ctx context.Context, profileURL string) (string, error) {
 	if p.cfg.CamoufoxURL == "" {
 		return "", errors.New("linkedin: camoufox not configured")
 	}
-	return "", errors.New("linkedin: camoufox path not implemented")
+
+	body, err := json.Marshal(camoufoxFetchRequest{
+		URL:             profileURL,
+		Profile:         "linkedin",
+		WaitForSelector: "main",
+		TimeoutMS:       20_000,
+	})
+	if err != nil {
+		return "", fmt.Errorf("linkedin: %w: marshal camoufox request: %v", shared.ErrTransient, err)
+	}
+
+	endpoint := strings.TrimRight(p.cfg.CamoufoxURL, "/") + "/fetch"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("linkedin: %w: build camoufox request: %v", shared.ErrTransient, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := p.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("linkedin: %w: camoufox: %v", shared.ErrTransient, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		return "", fmt.Errorf("linkedin: %w: read camoufox body: %v", shared.ErrTransient, err)
+	}
+
+	var parsed camoufoxFetchResponse
+	if jerr := json.Unmarshal(raw, &parsed); jerr != nil {
+		return "", fmt.Errorf("linkedin: %w: parse camoufox response (http %d): %v", shared.ErrTransient, resp.StatusCode, jerr)
+	}
+	if resp.StatusCode >= 500 || resp.StatusCode == http.StatusBadGateway {
+		msg := parsed.Error
+		if msg == "" {
+			msg = fmt.Sprintf("http %d", resp.StatusCode)
+		}
+		return "", fmt.Errorf("linkedin: %w: camoufox: %s", shared.ErrTransient, msg)
+	}
+	if resp.StatusCode >= 400 {
+		msg := parsed.Error
+		if msg == "" {
+			msg = fmt.Sprintf("http %d", resp.StatusCode)
+		}
+		return "", fmt.Errorf("linkedin: camoufox: %s", msg)
+	}
+	if parsed.HTML == "" {
+		return "", fmt.Errorf("linkedin: %w: camoufox returned empty HTML", shared.ErrTransient)
+	}
+	return parsed.HTML, nil
 }
 
 // --- Posts ---

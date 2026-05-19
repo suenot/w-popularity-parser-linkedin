@@ -2,7 +2,9 @@ package parser
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -314,16 +316,115 @@ func TestFetchChannel_HandleNormalization(t *testing.T) {
 	}
 }
 
-// --- Camoufox stub: when set-but-stubbed, no-cookie still ends in ErrAuth ---
+// --- Camoufox unreachable: no cookie + unreachable camoufox -> ErrAuth ---
 
-func TestFetchChannel_CamoufoxStubFallback(t *testing.T) {
+func TestFetchChannel_CamoufoxUnreachable(t *testing.T) {
 	p := New(Config{
-		CamoufoxURL: "ws://example.invalid/cdp",
+		// Resolves to nothing; DNS NXDOMAIN -> immediate failure.
+		CamoufoxURL: "http://camoufox-does-not-exist.invalid:9/",
 	})
 	_, err := p.FetchChannel(context.Background(), "suenot")
 	if !errors.Is(err, shared.ErrAuth) {
-		t.Fatalf("want ErrAuth even when camoufox is set-but-stubbed, got %v", err)
+		t.Fatalf("want ErrAuth when camoufox is unreachable, got %v", err)
 	}
+}
+
+// --- Camoufox happy path: no cookie, wrapper returns datalet HTML ---
+
+func TestFetchChannel_ViaCamoufox(t *testing.T) {
+	// Set up a mock camoufox wrapper that returns the same datalet HTML
+	// the cookie-auth path uses. The parser should extract followers from
+	// the wrapper-returned HTML identically.
+	var gotBody []byte
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"html": ` + jsonQuote(dataletHTML) + `,
+			"status": 200,
+			"final_url": "https://www.linkedin.com/in/suenot/",
+			"title": "Eugen Soloviov | LinkedIn",
+			"cookies_present": true
+		}`))
+	}))
+	defer srv.Close()
+
+	p := New(Config{
+		HTTPClient:  srv.Client(),
+		CamoufoxURL: srv.URL,
+		// no LIATCookie -> the parser must take the camoufox branch
+	})
+	snap, err := p.FetchChannel(context.Background(), "suenot")
+	if err != nil {
+		t.Fatalf("FetchChannel via camoufox: %v", err)
+	}
+	if gotPath != "/fetch" {
+		t.Errorf("camoufox path = %q, want /fetch", gotPath)
+	}
+	var reqBody struct {
+		URL             string `json:"url"`
+		Profile         string `json:"profile"`
+		WaitForSelector string `json:"wait_for_selector"`
+		TimeoutMS       int    `json:"timeout_ms"`
+	}
+	if err := json.Unmarshal(gotBody, &reqBody); err != nil {
+		t.Fatalf("camoufox request body not JSON: %v (raw=%s)", err, string(gotBody))
+	}
+	if reqBody.URL != "https://www.linkedin.com/in/suenot/" {
+		t.Errorf("camoufox req url = %q", reqBody.URL)
+	}
+	if reqBody.Profile != "linkedin" {
+		t.Errorf("camoufox req profile = %q, want linkedin", reqBody.Profile)
+	}
+	if reqBody.WaitForSelector != "main" {
+		t.Errorf("camoufox req wait_for_selector = %q", reqBody.WaitForSelector)
+	}
+	if reqBody.TimeoutMS == 0 {
+		t.Errorf("camoufox req timeout_ms = 0, want >0")
+	}
+	// Same assertions as the cookie-auth happy path: extractors are
+	// identical, only the fetch transport changed.
+	if snap.Followers != 4242 {
+		t.Errorf("followers = %d, want 4242", snap.Followers)
+	}
+	if snap.URL != "https://www.linkedin.com/in/suenot/" {
+		t.Errorf("url = %q (must be canonical)", snap.URL)
+	}
+	if got := snap.Raw["headline"]; got != "Builds things" {
+		t.Errorf("headline = %v", got)
+	}
+	if got := snap.Raw["source"]; got != "bpr_datalet" {
+		t.Errorf("source = %v, want bpr_datalet", got)
+	}
+}
+
+// --- Camoufox returns 502 with error envelope -> ErrAuth (wrapped) ---
+
+func TestFetchChannel_CamoufoxError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"navigation timeout"}`))
+	}))
+	defer srv.Close()
+
+	p := New(Config{
+		HTTPClient:  srv.Client(),
+		CamoufoxURL: srv.URL,
+	})
+	_, err := p.FetchChannel(context.Background(), "suenot")
+	if !errors.Is(err, shared.ErrAuth) {
+		t.Fatalf("want ErrAuth (wraps camoufox failure), got %v", err)
+	}
+}
+
+// jsonQuote returns s as a valid JSON string literal, suitable for inlining
+// into a manually-built JSON payload.
+func jsonQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
 
 // --- LD-JSON tolerance ---
