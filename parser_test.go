@@ -236,9 +236,10 @@ func TestFetchChannel_RateLimited(t *testing.T) {
 	}
 }
 
-// --- 200 with no extractable structure -> soft success + fetch_note ---
+// --- 200 with no extractable structure -> transient failure so the scheduler
+// keeps the previous valid snapshot instead of recording a bogus zero.
 
-func TestFetchChannel_NoStructure_Soft(t *testing.T) {
+func TestFetchChannel_NoStructure_Transient(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`<html><head><title>x</title></head><body><h1>profile</h1></body></html>`))
 	}))
@@ -249,18 +250,9 @@ func TestFetchChannel_NoStructure_Soft(t *testing.T) {
 		LIATCookie: "AQEDTOKEN",
 		BaseURL:    srv.URL,
 	})
-	snap, err := p.FetchChannel(context.Background(), "suenot")
-	if err != nil {
-		t.Fatalf("expected soft success, got err=%v", err)
-	}
-	if snap.Followers != 0 {
-		t.Fatalf("followers = %d, want 0 (no signal)", snap.Followers)
-	}
-	if snap.Handle != "suenot" {
-		t.Fatalf("handle = %q", snap.Handle)
-	}
-	if _, ok := snap.Raw["fetch_note"]; !ok {
-		t.Fatalf("expected fetch_note diagnostic, got Raw=%v", snap.Raw)
+	_, err := p.FetchChannel(context.Background(), "suenot")
+	if !errors.Is(err, shared.ErrTransient) {
+		t.Fatalf("want ErrTransient when DOM has no extractable data, got %v", err)
 	}
 }
 

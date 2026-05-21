@@ -183,6 +183,13 @@ func (p *LinkedInParser) FetchChannel(ctx context.Context, handle string) (share
 	}
 
 	snap := parseProfileHTML(body, h, canonicalURL)
+	// If none of the extractors found a follower/connection count we treat
+	// this as a transient parse failure rather than a legitimate zero. This
+	// prevents a DOM rotation from wiping out the previous valid value and
+	// producing a bogus -100 % delta.
+	if snap.Followers == 0 && snap.Raw["fetch_note"] != nil {
+		return shared.ChannelSnapshot{}, fmt.Errorf("linkedin: %w: no structured data extracted (DOM may have rotated)", shared.ErrTransient)
+	}
 	return snap, nil
 }
 
@@ -416,7 +423,10 @@ func parseProfileHTML(body, handle, profileURL string) shared.ChannelSnapshot {
 var reTextCounters = regexp.MustCompile(`([\d,]+)\+?\s+(connection|follower)s?\b`)
 
 func applyTextCounters(snap *shared.ChannelSnapshot, body string) bool {
-	matches := reTextCounters.FindAllStringSubmatch(body, -1)
+	// Normalize common HTML entities that LinkedIn inserts between the
+	// numeric counter and the label (e.g. "218&nbsp;connections").
+	clean := strings.ReplaceAll(body, "&nbsp;", " ")
+	matches := reTextCounters.FindAllStringSubmatch(clean, -1)
 	if len(matches) == 0 {
 		return false
 	}
