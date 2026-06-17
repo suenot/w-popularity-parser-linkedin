@@ -1,4 +1,4 @@
-# w-popularity-parser-linkedin
+# linkedin-auto
 
 `linkedin` parser for [w_popularity](https://github.com/suenot/w-popularity).
 
@@ -62,7 +62,7 @@ keep one expiry from taking down the pipeline.
 ## Configuration
 
 ```go
-import parser "github.com/suenot/w-popularity-parser-linkedin"
+import parser "github.com/suenot/linkedin-auto"
 
 p := parser.New(parser.Config{
     LIATCookie:  os.Getenv("LINKEDIN_LI_AT"),     // primary auth

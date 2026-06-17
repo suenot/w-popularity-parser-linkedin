@@ -69,7 +69,7 @@ import (
 	"strings"
 	"time"
 
-	shared "github.com/suenot/w-popularity-shared"
+	shared "github.com/suenot/socials-auto"
 )
 
 // defaultBaseURL is the canonical LinkedIn origin. Tests rewrite this via
